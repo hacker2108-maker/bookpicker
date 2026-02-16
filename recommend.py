@@ -1,5 +1,7 @@
 """
 Recommend a book from the trained catalog. Premium terminal output.
+Remembers what it already recommended so it won't suggest the same book twice
+(use --allow-repeat to ignore history).
 Usage:
   python recommend.py                    # pick one or more (diversity-aware)
   python recommend.py --similar "Title"  # recommend similar to given title
@@ -15,10 +17,13 @@ import numpy as np
 import torch
 
 MODELS_DIR = Path(__file__).resolve().parent / "models"
+DATA_DIR = Path(__file__).resolve().parent / "data"
 MODEL_PATH = MODELS_DIR / "encoder.pt"
 BOOKS_JSON = MODELS_DIR / "books.json"
 EMBEDDINGS_NPY = MODELS_DIR / "embeddings.npy"
 PREPROCESSOR_PKL = MODELS_DIR / "preprocessor.pkl"
+HISTORY_PATH = DATA_DIR / "recommendation_history.json"
+MAX_HISTORY_ENTRIES = 500
 
 # Fallback for preprocessors saved before we added embed_dim / hidden_dims
 DEFAULT_EMBED_DIM = 64
@@ -118,32 +123,84 @@ def find_book_by_title(books, query):
     return None
 
 
-def nearest_indices(embeddings, query_embedding, k=5, exclude_index=None):
+def load_history():
+    """Load set of (title_lower, author_lower) already recommended."""
+    if not HISTORY_PATH.exists():
+        return set()
+    try:
+        with open(HISTORY_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        entries = data.get("recommended", data) if isinstance(data, dict) else data
+        return {(e.get("title", "").strip().lower(), e.get("author", "").strip().lower()) for e in entries if isinstance(e, dict)}
+    except Exception:
+        return set()
+
+
+def save_history(new_entries):
+    """Append new (title, author) to history and trim to MAX_HISTORY_ENTRIES."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    existing = []
+    if HISTORY_PATH.exists():
+        try:
+            with open(HISTORY_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+            existing = data.get("recommended", data) if isinstance(data, dict) else data
+            if not isinstance(existing, list):
+                existing = []
+        except Exception:
+            existing = []
+    existing.extend(new_entries)
+    if len(existing) > MAX_HISTORY_ENTRIES:
+        existing = existing[-MAX_HISTORY_ENTRIES:]
+    with open(HISTORY_PATH, "w", encoding="utf-8") as f:
+        json.dump({"recommended": existing}, f, ensure_ascii=False, indent=0)
+
+
+def indices_already_recommended(books, history_set):
+    """Return set of book indices whose (title, author) is in history."""
+    return {i for i, b in enumerate(books) if (_str_field(b.get("title")).lower(), _str_field(b.get("author")).lower()) in history_set}
+
+
+def nearest_indices(embeddings, query_embedding, k=5, exclude_index=None, exclude_indices=None):
     diff = embeddings - query_embedding
     dists = np.linalg.norm(diff, axis=1)
     if exclude_index is not None:
         dists[exclude_index] = np.inf
+    if exclude_indices:
+        for i in exclude_indices:
+            dists[i] = np.inf
     return np.argsort(dists)[:k]
 
 
-def pick_diverse(embeddings, n, weights=None):
-    """Pick n indices with diversity in embedding space (iterative farthest)."""
-    if n >= len(embeddings):
-        return np.arange(len(embeddings))
+def pick_diverse(embeddings, n, weights=None, exclude_indices=None):
+    """Pick n indices with diversity in embedding space; exclude_indices are not chosen."""
+    exclude_indices = exclude_indices or set()
+    available = [i for i in range(len(embeddings)) if i not in exclude_indices]
+    if not available:
+        available = list(range(len(embeddings)))
+    if n >= len(available):
+        return np.array(available[:n])
     if weights is not None:
-        weights = np.array(weights, dtype=float)
-        weights /= weights.sum()
+        w = np.array(weights, dtype=float)
+        w = w / w.sum()
+        weights_av = np.array([w[i] for i in available], dtype=float)
+        weights_av /= weights_av.sum()
+    else:
+        weights_av = None
     rng = np.random.default_rng()
-    chosen = [int(rng.choice(len(embeddings), p=weights)) if weights is not None else rng.integers(0, len(embeddings))]
+    first_av = int(rng.choice(len(available), p=weights_av)) if weights_av is not None else rng.integers(0, len(available))
+    chosen_global = [available[first_av]]
     for _ in range(n - 1):
-        centroid = np.mean(embeddings[chosen], axis=0)
+        centroid = np.mean(embeddings[chosen_global], axis=0)
         dists = np.linalg.norm(embeddings - centroid, axis=1)
-        for c in chosen:
+        for c in chosen_global:
+            dists[c] = -np.inf
+        for c in exclude_indices:
             dists[c] = -np.inf
         if weights is not None:
             dists = np.maximum(dists, 0) * weights
-        chosen.append(int(np.argmax(dists)))
-    return np.array(chosen)
+        chosen_global.append(int(np.argmax(dists)))
+    return np.array(chosen_global)
 
 
 # ---- Premium output ----
@@ -208,6 +265,7 @@ def main():
     parser.add_argument("--similar", type=str, default=None, metavar="TITLE", help="Recommend books similar to this title")
     parser.add_argument("-n", type=int, default=1, help="Number of recommendations (default 1)")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output")
+    parser.add_argument("--allow-repeat", action="store_true", help="Ignore history; allow recommending the same book again")
     args = parser.parse_args()
 
     if args.no_color:
@@ -215,6 +273,9 @@ def main():
         USE_COLOR = False
 
     books, embeddings, preproc, encoder, input_dim = load_artifacts()
+
+    history_set = set() if args.allow_repeat else load_history()
+    exclude_indices = indices_already_recommended(books, history_set) if history_set else set()
 
     if args.similar is not None:
         idx = find_book_by_title(books, args.similar)
@@ -225,10 +286,19 @@ def main():
         x = torch.from_numpy(book_vec.reshape(1, -1))
         with torch.no_grad():
             q_embed = encoder(x).numpy().flatten()
-        nearest = nearest_indices(embeddings, q_embed, k=min(args.n + 1, len(books)), exclude_index=idx)
+        nearest = nearest_indices(
+            embeddings, q_embed,
+            k=min(args.n + 10, len(books)),
+            exclude_index=idx,
+            exclude_indices=exclude_indices,
+        )
+        # Take first n that are not excluded (nearest_indices already excluded, but we asked for n+10)
+        shown = [j for j in nearest[: args.n]]
         print_header(f'Books similar to "{books[idx]["title"]}"')
-        for i, j in enumerate(nearest[: args.n]):
+        for i, j in enumerate(shown):
             print_book_card(books[j], index=i + 1)
+        if not args.allow_repeat and shown:
+            save_history([{"title": books[j]["title"], "author": books[j].get("author") or ""} for j in shown])
         return
 
     n = min(args.n, len(books))
@@ -237,10 +307,12 @@ def main():
         ranks = np.array([b.get("rank") or 1000 for b in books], dtype=float)
         weights = 1.0 / (ranks + 1)
         weights /= weights.sum()
-    indices = pick_diverse(embeddings, n, weights)
+    indices = pick_diverse(embeddings, n, weights, exclude_indices=exclude_indices)
     print_header("Your next read")
     for i, j in enumerate(indices):
         print_book_card(books[j], index=i + 1)
+    if not args.allow_repeat and len(indices) > 0:
+        save_history([{"title": books[j]["title"], "author": books[j].get("author") or ""} for j in indices])
 
 
 if __name__ == "__main__":

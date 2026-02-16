@@ -18,6 +18,13 @@ A **local, production-style** book recommendation system: it fetches or loads bo
 - [Model and training (technical)](#model-and-training-technical)
 - [Recommendation logic](#recommendation-logic)
 - [Troubleshooting](#troubleshooting)
+- [License](#license)
+
+---
+
+## License
+
+This project is licensed under the **MIT License**. You may use, copy, modify, merge, publish, distribute, sublicense, and sell copies of the software as you want, subject to including the copyright notice and license text. See the [LICENSE](LICENSE) file in the repo for the full text.
 
 ---
 
@@ -25,7 +32,7 @@ A **local, production-style** book recommendation system: it fetches or loads bo
 
 1. **Fetch** – Downloads classic books from the internet (CORGIS, optional Open Library) and/or loads your own CSV/JSON. **Each run adds to the existing dataset** so the catalog grows over time.
 2. **Train** – Builds a neural network (autoencoder) on book metadata (author, subjects, year, etc.), learns a compact representation (embedding) for each book, and saves the model and preprocessor.
-3. **Recommend** – Picks a book at random (with diversity) or finds books similar to a title you give, using the learned embeddings. Output is formatted with clear cards and optional colors.
+3. **Recommend** – Picks a book at random (with diversity) or finds books similar to a title you give. **Remembers what it already recommended** so it won’t suggest the same book twice (history is stored in `data/recommendation_history.json`). Use `--allow-repeat` to ignore history.
 
 Everything runs **locally** after the initial data fetch; no cloud or API is needed for training or recommendations.
 
@@ -37,11 +44,12 @@ Everything runs **locally** after the initial data fetch; no cloud or API is nee
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  FETCH (fetch_data.py)                                                   │
 │  • Loads existing data/books_processed.csv if present (additive)         │
-│  • Optionally downloads CORGIS classics CSV                              │
-│  • Optionally fetches Open Library by subject (rate-limited)             │
-│  • Optionally loads your --file (CSV/JSON)                               │
-│  • Merges all, dedupes by (title, author), normalizes schema              │
-│  • Saves to data/books_processed.csv and .json                            │
+│  • Downloads CORGIS classics CSV                                          │
+│  • Fetches Gutendex (Project Gutenberg public API, no key)               │
+│  • Optionally Open Library by subject (--open-library)                    │
+│  • Optionally your --file (CSV/JSON)                                     │
+│  • All APIs used are free public APIs (no API keys)                       │
+│  • Merges all, dedupes, normalizes schema → data/books_processed.*       │
 └─────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
@@ -60,11 +68,12 @@ Everything runs **locally** after the initial data fetch; no cloud or API is nee
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  RECOMMEND (recommend.py)                                                 │
-│  • Loads model, books, embeddings, preprocessor                          │
-│  • “Pick one”: diversity-aware sampling in embedding space (or weighted  │
-│    by popularity); prints formatted book card(s)                          │
-│  • “Similar to X”: embeds the query book, finds k nearest in embedding    │
-│    space, prints formatted cards                                          │
+│  • Loads model, books, embeddings, preprocessor, recommendation history  │
+│  • “Pick one”: diversity-aware sampling; excludes already-recommended    │
+│    books; appends this run’s picks to history                             │
+│  • “Similar to X”: k nearest in embedding space; excludes history;        │
+│    appends to history so those titles aren’t suggested again as “pick”    │
+│  • History: data/recommendation_history.json (last 500 entries)           │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -157,12 +166,16 @@ python recommend.py --no-color
 
 | Option | Description |
 |--------|-------------|
-| (none) | Load existing data (if any), fetch CORGIS classics, merge and save. |
+| (none) | Load existing (if any), fetch CORGIS + Gutendex, merge and save. |
 | **--file PATH** | Load your CSV or JSON and merge into the dataset (additive). |
 | **--no-fetch** | Do not fetch from internet. Only merge existing + `--file` (or keep existing only if no `--file`). |
+| **--no-gutendex** | Skip Gutendex; only fetch CORGIS (faster, fewer books). |
+| **--gutendex-pages N** | Max Gutendex pages (default 20). |
 | **--open-library** | Also fetch from Open Library (classics, fiction, sci-fi, mystery, romance, historical fiction) with rate limiting. |
 | **--open-library-delay N** | Seconds between Open Library API requests (default: 1.0). |
 | **--reset** | Ignore existing `books_processed`; build only from this run’s fetch and `--file`. |
+
+All data sources are **free public APIs**; no API keys are required.
 
 **Your CSV/JSON format**
 
@@ -181,8 +194,9 @@ python recommend.py --no-color
 
 **Recommend**
 
-- **Pick one or more:** `recommend.bat` or `recommend.bat -n 3`. Uses diversity in embedding space so multiple picks are varied.
-- **Similar to a title:** `recommend.bat --similar "Crime and Punishment" -n 5`. Finds nearest neighbors in the learned embedding space.
+- **Pick one or more:** `recommend.bat` or `recommend.bat -n 3`. Uses diversity in embedding space. **Books already recommended are excluded** so you don’t get the same suggestion twice (history is saved in `data/recommendation_history.json`).
+- **Similar to a title:** `recommend.bat --similar "Crime and Punishment" -n 5`. Finds nearest neighbors; also skips books in history and adds this run’s suggestions to history.
+- **Allow repeats:** `recommend.bat --allow-repeat` ignores history and does not append to it.
 - **Plain output:** `recommend.bat --no-color` disables ANSI colors.
 
 ---
@@ -204,6 +218,7 @@ python recommend.py --no-color
 | **data/raw/** | Raw downloads (e.g. CORGIS classics.csv). |
 | **data/books_processed.csv** | Unified book table (additive across runs). |
 | **data/books_processed.json** | Same data in JSON. |
+| **data/recommendation_history.json** | Books already recommended (so they aren’t suggested again). |
 | **models/** | Trained model and artifacts. |
 | **models/encoder.pt** | Encoder weights (PyTorch). |
 | **models/books.json** | Book list used for recommendations. |
@@ -214,10 +229,11 @@ python recommend.py --no-color
 
 ---
 
-## Data sources
+## Data sources (all free public APIs, no keys)
 
-- **CORGIS classics** – Single CSV of ~1,000 classic books (Project Gutenberg, by download popularity). No API key; one HTTP GET per run.
-- **Open Library** – Free Subjects API. Used when you pass `--open-library`. Subjects: classics, fiction, science_fiction, mystery_and_detective_stories, romance, historical_fiction. Rate-limited (configurable with `--open-library-delay`).
+- **CORGIS classics** – Single CSV of ~1,000 classic books (Project Gutenberg). One HTTP GET per run.
+- **Gutendex** – [Project Gutenberg](https://gutendex.com/) free public JSON API; no key. Fetched by default (many more English classics). Use `--no-gutendex` to skip.
+- **Open Library** – Free [Subjects API](https://openlibrary.org/developers/api). Used when you pass `--open-library`. Subjects: classics, fiction, science_fiction, mystery, romance, historical_fiction. Rate-limited.
 - **Your file** – Any CSV or JSON with title, author, subjects/genre, optional year. Merged additively.
 
 ---
@@ -233,8 +249,9 @@ python recommend.py --no-color
 
 ## Recommendation logic
 
-- **“Pick one” (or `-n N`):** Weights by inverse rank (when available) so more popular books are slightly more likely; then uses **diversity sampling**: iteratively pick the next book farthest from the centroid of already chosen books in embedding space, so suggestions are varied.
-- **“Similar to Title”:** Embeds the matching book with the same preprocessor and encoder, finds k nearest books by L2 distance in embedding space (excluding the query book), and prints them in a formatted card layout.
+- **History:** Each time you run recommend (pick one or similar), the suggested books are appended to `data/recommendation_history.json` (up to the last 500 entries). Future runs **exclude** any book in that history so the same book is not recommended again. Use `--allow-repeat` to disable this.
+- **“Pick one” (or `-n N`):** Excludes books in history, then weights by inverse rank (when available) and uses **diversity sampling**: iteratively pick the next book farthest from the centroid of already chosen books in embedding space. If every book was already recommended, it falls back to allowing repeats for that run.
+- **“Similar to Title”:** Embeds the matching book, finds k nearest by L2 distance (excluding the query book and books in history), prints formatted cards, and adds those suggestions to history.
 
 ---
 
@@ -250,4 +267,4 @@ python recommend.py --no-color
 
 ## License and public use
 
-You can use and share this project as you like. When sharing publicly, consider adding a LICENSE file and noting in the README that users should run `setup.bat` (or install dependencies) and then fetch/train/recommend as described above. The `data/` and `models/` folders are typically not committed (see `.gitignore`) so the repo stays small; users generate their own data and models by running the pipeline.
+This project is **MIT licensed** so you can modify and use it as you want. The `data/` and `models/` folders are typically not committed (see `.gitignore`) so the repo stays small; users run `setup.bat` then fetch/train/recommend to generate their own data and models. All book data is fetched from free public APIs (CORGIS, Gutendex, Open Library); no API keys are required.

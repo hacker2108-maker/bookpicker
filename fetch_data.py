@@ -1,6 +1,7 @@
 """
 Fetch classic book data from the internet and/or load your own spreadsheet.
-Uses CORGIS classics CSV, optional Open Library API (rate-limited), and optional --file for your CSV/JSON.
+Uses CORGIS classics CSV; optional Gutendex (Project Gutenberg), Open Library,
+and --file. All APIs used are free public APIs (no API keys required).
 """
 import argparse
 import csv
@@ -13,13 +14,14 @@ import requests
 # URLs and paths
 CORGIS_URL = "https://corgis-edu.github.io/corgis/datasets/csv/classics/classics.csv"
 OPEN_LIBRARY_BASE = "https://openlibrary.org"
+GUTENDEX_BASE = "https://gutendex.com/books"
 USER_AGENT = "BookMLRecommender/1.0 (local learning project)"
 DATA_DIR = Path(__file__).resolve().parent / "data"
 RAW_DIR = DATA_DIR / "raw"
 PROCESSED_CSV = DATA_DIR / "books_processed.csv"
 PROCESSED_JSON = DATA_DIR / "books_processed.json"
 
-# Open Library subjects for richer catalog (rate-limited)
+# Open Library subjects (free public API, rate-limited)
 OPEN_LIBRARY_SUBJECTS = [
     "classics",
     "fiction",
@@ -31,6 +33,10 @@ OPEN_LIBRARY_SUBJECTS = [
 WORKS_PER_SUBJECT = 120
 REQUEST_DELAY = 1.0
 MAX_RETRIES = 3
+
+# Gutendex = Project Gutenberg free public API, no key (https://gutendex.com)
+GUTENDEX_PAGES = 20
+GUTENDEX_DELAY = 0.4
 
 
 def ensure_dirs():
@@ -189,6 +195,62 @@ def load_user_file(path):
             norm = normalize_user_row(row, "user_file")
             if norm["title"] and norm["title"] != "Unknown":
                 yield norm
+
+
+def fetch_gutendex_page(page=1, languages="en"):
+    """Fetch one page from Gutendex (Project Gutenberg free public API, no key)."""
+    url = GUTENDEX_BASE
+    params = {"page": page, "languages": languages}
+    headers = {"User-Agent": USER_AGENT}
+    resp = requests.get(url, params=params, headers=headers, timeout=25)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def normalize_gutendex_book(book):
+    """Map Gutendex book to common schema."""
+    title = book.get("title") or ""
+    authors = book.get("authors") or []
+    author = authors[0].get("name", "") if authors else ""
+    subjects = book.get("subjects") or []
+    subs = ", ".join(subjects[:25])[:2000]
+    downloads = book.get("download_count") or 0
+    return {
+        "title": str(title).strip(),
+        "author": str(author).strip(),
+        "subjects": subs,
+        "publication_year": 0,
+        "downloads": int(downloads) if downloads else 0,
+        "rank": 0,
+        "flesch_reading_ease": 0.0,
+        "source": "gutendex",
+    }
+
+
+def fetch_gutendex(n_pages=GUTENDEX_PAGES, delay_sec=GUTENDEX_DELAY):
+    """Fetch multiple pages from Gutendex; rate-limited."""
+    seen = set()
+    rows = []
+    for page in range(1, n_pages + 1):
+        time.sleep(delay_sec)
+        try:
+            data = fetch_gutendex_page(page=page)
+        except Exception as e:
+            print(f"  Warning: Gutendex page {page}: {e}")
+            continue
+        results = data.get("results") or []
+        if not results:
+            break
+        for b in results:
+            norm = normalize_gutendex_book(b)
+            if not norm["title"]:
+                continue
+            key = (norm["title"].lower().strip(), norm["author"].lower().strip())
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(norm)
+    return rows
 
 
 def fetch_open_library_subject(subject, limit=50, offset=0):
@@ -364,6 +426,17 @@ def main():
         action="store_true",
         help="Ignore existing data and build from scratch (fetch + --file only).",
     )
+    parser.add_argument(
+        "--no-gutendex",
+        action="store_true",
+        help="Skip Gutendex (by default we fetch CORGIS + Gutendex for more books).",
+    )
+    parser.add_argument(
+        "--gutendex-pages",
+        type=int,
+        default=GUTENDEX_PAGES,
+        help=f"Max Gutendex pages to fetch (default {GUTENDEX_PAGES}).",
+    )
     args = parser.parse_args()
 
     ensure_dirs()
@@ -381,6 +454,12 @@ def main():
         corgis_rows = list(load_corgis_csv(path))
         print(f"  CORGIS: {len(corgis_rows)} books")
         all_rows.append(corgis_rows)
+
+        if not args.no_gutendex:
+            print("  Fetching Gutendex (Project Gutenberg public API)...")
+            gutendex_rows = fetch_gutendex(n_pages=args.gutendex_pages, delay_sec=GUTENDEX_DELAY)
+            print(f"  Gutendex: {len(gutendex_rows)} books")
+            all_rows.append(gutendex_rows)
 
         if args.open_library:
             print("  Fetching Open Library (classics, fiction, sci-fi, mystery, romance, historical)...")
